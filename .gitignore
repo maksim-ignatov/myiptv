@@ -1,0 +1,16 @@
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.log
+*.ts
+__pycache__/
+*.pyc
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.log
+*.ts
+__pycache__/
+*.pyc
