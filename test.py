@@ -7,22 +7,12 @@ import subprocess
 import threading
 from datetime import datetime
 
-VIDEO_DIRS = {
-    'early_morning': 'early_morning',  # 5-7
-    'morning': 'morning',              # 7-10
-    'late_morning': 'late_morning',    # 10-12
-    'afternoon': 'afternoon',          # 12-15
-    'evening': 'evening',              # 15-18
-    'late_evening': 'late_evening',    # 18-21
-    'night': 'night',                  # 21-24
-    'late_night': 'late_night'         # 0-5
-}
-
 BASE_PATH = os.path.expanduser('~/iptv-cartoons')
+SAMPLE_DIR = 'sample'  # Новая папка для тестовых видео
 
 FFMPEG_CMD_TEMPLATE = [
     'ffmpeg', '-re', '-i', '',
-
+    
     # Видео
     '-c:v', 'libx264',
     '-preset', 'veryfast',
@@ -57,49 +47,17 @@ FFMPEG_CMD_TEMPLATE = [
     'rtsp://127.0.0.1:8554/stream'
 ]
 
-
 current_process = None
-played_videos = {
-    'early_morning': set(),
-    'morning': set(),
-    'late_morning': set(),
-    'afternoon': set(),
-    'evening': set(),
-    'late_evening': set(),
-    'night': set(),
-    'late_night': set()
-}
-
-
-def get_current_category():
-    hour = datetime.now().hour
-    if 5 <= hour < 7:
-        return 'early_morning'
-    elif 7 <= hour < 10:
-        return 'morning'
-    elif 10 <= hour < 12:
-        return 'late_morning'
-    elif 12 <= hour < 15:
-        return 'afternoon'
-    elif 15 <= hour < 18:
-        return 'evening'
-    elif 18 <= hour < 21:
-        return 'late_evening'
-    elif 21 <= hour < 24:
-        return 'night'
-    else:  # 0-5
-        return 'late_night'
-
+played_videos = set()  # Единый набор для всех воспроизведенных видео
 
 def find_videos(folder):
     videos = []
     for root, _, files in os.walk(folder, followlinks=True):
         for file in files:
-            if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mpg', '.mov', '.AVI', '.ts')):
+            if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')):
                 full_path = os.path.join(root, file)
                 videos.append(full_path)
     return videos
-
 
 def play_video(video_path):
     global current_process
@@ -110,7 +68,6 @@ def play_video(video_path):
     print(f"[{datetime.now()}] ▶ Запуск видео: {video_path}")
 
     try:
-        # Запускаем ffmpeg и читаем stderr
         current_process = subprocess.Popen(
             cmd,
             stderr=subprocess.PIPE,
@@ -130,67 +87,56 @@ def play_video(video_path):
                     current_process.kill()
                     break
 
-        # Запускаем мониторинг ошибок в отдельном потоке
         monitor_thread = threading.Thread(target=monitor_errors)
         monitor_thread.start()
 
-        current_process.wait()  # Ждём завершения ffmpeg
+        current_process.wait()
         monitor_thread.join()
 
         if error_detected:
             print(f"[{datetime.now()}] 🔁 Видео прервано из-за ошибки. Переходим к следующему.")
-            return False  # Ошибка — перейти к следующему видео
+            return False
 
         print(f"[{datetime.now()}] ⏹ Видео завершилось: {video_path}")
-        return True  # Успешно проиграно до конца
+        return True
 
     except Exception as e:
         print(f"[{datetime.now()}] ⚠ Ошибка при запуске ffmpeg: {e}")
         return False
 
-
 def continuous_playback():
-    current_category = get_current_category()
-    print(f"[{datetime.now()}] ▶ Начинаем показ категории: {current_category}")
+    print(f"[{datetime.now()}] ▶ Начинаем тестовый показ из папки 'sample'")
 
     while True:
-        new_category = get_current_category()
-
-        if new_category != current_category:
-            print(f"[{datetime.now()}] 🔄 Переход на новую категорию: {new_category}")
-            current_category = new_category
-
-        folder = os.path.join(BASE_PATH, VIDEO_DIRS[current_category])
+        folder = os.path.join(BASE_PATH, SAMPLE_DIR)
         all_videos = find_videos(folder)
-        already_played = played_videos[current_category]
 
         if not all_videos:
             print(f"[{datetime.now()}] ⚠ Нет видео в папке: {folder}")
             time.sleep(10)
             continue
 
-        # Обновляем список невоспроизведённых
-        unplayed_videos = [v for v in all_videos if v not in already_played]
+        unplayed_videos = [v for v in all_videos if v not in played_videos]
         if not unplayed_videos:
-            print(f"[{datetime.now()}] ✅ Все видео в {current_category} были воспроизведены. Сброс.")
-            played_videos[current_category].clear()
+            print(f"[{datetime.now()}] ✅ Все тестовые видео были воспроизведены. Сброс.")
+            played_videos.clear()
             unplayed_videos = all_videos[:]
 
-        random.shuffle(unplayed_videos)  # случайный порядок
+        random.shuffle(unplayed_videos)
 
         for video_path in unplayed_videos:
             print(f"[{datetime.now()}] 🟡 Пытаемся воспроизвести: {video_path}")
             success = play_video(video_path)
 
             if success:
-                played_videos[current_category].add(video_path)
-                break  # выйти из цикла и перейти к следующему видео
+                played_videos.add(video_path)
+                break
             else:
-                print(f"[{datetime.now()}] ⚠ Ошибка с {video_path} — пробуем следующее...\n")
-                continue  # пробуем следующее видео
+                print(f"[{datetime.now()}] ⚠ Ошибка с {video_path} - пробуем следующее...\n")
+                continue
 
         time.sleep(1)
 
 if __name__ == '__main__':
-    print("🚀 IPTV-поток запущен. Ожидаем видео...\n")
+    print("🧪 Тестовый поток запущен. Ожидаем видео...\n")
     continuous_playback()
