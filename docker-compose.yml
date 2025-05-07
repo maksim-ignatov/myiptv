@@ -16,7 +16,7 @@ services:
       - MTX_LOGLEVEL=debug
 
   iptv-app:
-    image: maksimignatov1337/myiptv:0.2
+    image: maksimignatov1337/myiptv:latest
     container_name: myiptv
     volumes:
       - ./videos:/app/videos
