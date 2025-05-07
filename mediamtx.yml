@@ -1,0 +1,8 @@
+srt: yes
+srtAddress: :9710
+
+paths:
+  iptv_stream:
+    source: srt
+    sourceProtocol: srt
+    rtmp: yes

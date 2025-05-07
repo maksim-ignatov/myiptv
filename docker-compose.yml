@@ -1,0 +1,32 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest-ffmpeg
+    container_name: mediamtx
+    ports:
+      - "8890:8890"
+      - "8554:8554"
+      - "9710:9710"
+      - "1935:1935"
+      - "8889:8889"
+    networks:
+      - iptv-net
+    restart: unless-stopped
+    environment:
+      - MTX_RTSPTRANSPORTS=tcp
+      - MTX_LOGLEVEL=debug
+
+  iptv-app:
+    image: maksimignatov1337/myiptv:0.2
+    container_name: myiptv
+    volumes:
+      - ./videos:/app/videos
+      - /mnt:/mnt
+    depends_on:
+      - mediamtx
+    networks:
+      - iptv-net
+    restart: unless-stopped
+
+networks:
+  iptv-net:
+    driver: bridge

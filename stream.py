@@ -8,17 +8,17 @@ import threading
 from datetime import datetime
 
 VIDEO_DIRS = {
-    'early_morning': 'early_morning',  # 5-7
-    'morning': 'morning',              # 7-10
-    'late_morning': 'late_morning',    # 10-12
-    'afternoon': 'afternoon',          # 12-15
-    'evening': 'evening',              # 15-18
-    'late_evening': 'late_evening',    # 18-21
-    'night': 'night',                  # 21-24
-    'late_night': 'late_night'         # 0-5
+    'early_morning': 'videos/early_morning',  # 5-7
+    'morning': 'videos/morning',              # 7-10
+    'late_morning': 'videos/late_morning',    # 10-12
+    'afternoon': 'videos/afternoon',          # 12-15
+    'evening': 'videos/evening',              # 15-18
+    'late_evening': 'videos/late_evening',    # 18-21
+    'night': 'videos/night',                  # 21-24
+    'late_night': 'videos/late_night'         # 0-5
 }
 
-BASE_PATH = os.path.expanduser('~/iptv-cartoons')
+BASE_PATH = '/app'
 
 FFMPEG_CMD_TEMPLATE = [
     'ffmpeg', '-re', '-i', '',
@@ -30,7 +30,7 @@ FFMPEG_CMD_TEMPLATE = [
     '-x264-params', 'repeat-headers=1',
     '-crf', '23',
     '-maxrate', '2000k',
-    '-bufsize', '2000k',
+    '-bufsize', '500k',
 
     # Аудио
     '-c:a', 'aac',
@@ -45,7 +45,7 @@ FFMPEG_CMD_TEMPLATE = [
     '-sc_threshold', '0',
 
     # Поведение
-    '-fflags', '+genpts+flush_packets',
+    '-fflags', '+genpts+flush_packets+nobuffer',
     '-avoid_negative_ts', 'make_zero',
     '-flush_packets', '1',
     '-max_muxing_queue_size', '1024',
@@ -54,7 +54,7 @@ FFMPEG_CMD_TEMPLATE = [
     '-loglevel', 'warning',
     '-f', 'rtsp',
     '-rtsp_transport', 'tcp',
-    'rtsp://127.0.0.1:8554/stream'
+    'rtsp://mediamtx:8554/stream'
 ]
 
 
