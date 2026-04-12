@@ -22,6 +22,7 @@ VIDEO_DIRS = {
 BASE_PATH = '/app'
 RTSP_URL = os.getenv('RTSP_URL', 'rtsp://mediamtx:8554/stream')
 AUDIO_TRACK = int(os.getenv('AUDIO_TRACK', '0'))
+AUDIO_CONFIG_FILE = os.path.join(BASE_PATH, 'audio_config.myiptv')
 
 # Если ffmpeg завершился быстрее этого порога — скорее всего RTSP недоступен,
 # а не проблема в файле. Видео НЕ помечаем как воспроизведённое.
@@ -106,25 +107,130 @@ def get_current_category():
         return 'late_night'
 
 
+def load_audio_config():
+    """Читает audio_config.myiptv, возвращает dict {папка: предпочтение}."""
+    config = {}
+    if not os.path.isfile(AUDIO_CONFIG_FILE):
+        return config
+    try:
+        with open(AUDIO_CONFIG_FILE, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    folder, _, pref = line.partition('=')
+                    config[folder.strip()] = pref.strip()
+    except OSError:
+        pass
+    return config
+
+
+def get_audio_streams(video_path):
+    """Возвращает список дорожек: [{'index': 0, 'lang': 'rus', 'title': '...'}]"""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error',
+             '-show_entries', 'stream=index,codec_type:stream_tags=language,title',
+             '-select_streams', 'a',
+             '-of', 'compact', video_path],
+            capture_output=True, text=True, timeout=10
+        )
+        streams = []
+        for line in result.stdout.splitlines():
+            if 'codec_type=audio' not in line:
+                continue
+            idx = len(streams)
+            lang = ''
+            title = ''
+            for part in line.split('|'):
+                if part.startswith('tag:language='):
+                    lang = part.split('=', 1)[1]
+                elif part.startswith('tag:title='):
+                    title = part.split('=', 1)[1]
+            streams.append({'index': idx, 'lang': lang, 'title': title})
+        return streams
+    except Exception:
+        return []
+
+
+def resolve_audio_track(streams, preference):
+    """
+    Находит индекс дорожки по предпочтению:
+      'Рен-ТВ'   → ищет по title (частичное совпадение, без регистра)
+      'rus'      → первая дорожка с языком rus
+      'rus:2'    → вторая дорожка с языком rus
+      '1'        → дорожка с индексом 1
+    """
+    if not streams:
+        return AUDIO_TRACK
+
+    pref = preference.strip()
+
+    # Число — прямой индекс
+    if pref.isdigit():
+        idx = int(pref)
+        return idx if idx < len(streams) else AUDIO_TRACK
+
+    # lang:N — N-й по счёту (1-based) с нужным языком
+    if ':' in pref:
+        lang, _, n = pref.partition(':')
+        lang = lang.strip().lower()
+        try:
+            n = int(n.strip())
+        except ValueError:
+            n = 1
+        matches = [s for s in streams if s['lang'].lower() == lang]
+        if matches and n <= len(matches):
+            return matches[n - 1]['index']
+        return AUDIO_TRACK
+
+    # Просто язык — первая подходящая дорожка
+    lang_lower = pref.lower()
+    for s in streams:
+        if s['lang'].lower() == lang_lower:
+            return s['index']
+
+    # Название перевода — поиск по title
+    for s in streams:
+        if pref.lower() in s['title'].lower():
+            return s['index']
+
+    return AUDIO_TRACK
+
+
 def get_audio_track(video_path):
+    """Определяет индекс аудиодорожки по конфигу audio_config.myiptv.
+    Поддерживает подпапки: 'South Park/Season 3' более специфично, чем 'South Park'.
+    Побеждает самое длинное совпадение.
     """
-    Ищет файл .audio_track в папке с видео или в родительских папках
-    вплоть до BASE_PATH. Если найден — возвращает номер дорожки из него.
-    Иначе — значение env AUDIO_TRACK (по умолчанию 0).
-    """
-    folder = os.path.dirname(video_path)
-    while folder.startswith(BASE_PATH):
-        track_file = os.path.join(folder, '.audio_track')
-        if os.path.isfile(track_file):
-            try:
-                track = int(open(track_file).read().strip())
-                return track
-            except (ValueError, OSError):
+    config = load_audio_config()
+    if not config:
+        return AUDIO_TRACK
+
+    path_parts_lower = [p.lower() for p in video_path.replace('\\', '/').split('/')]
+
+    best_match = None
+    best_len = 0
+
+    for folder_key, preference in config.items():
+        key_parts_lower = [p.strip().lower() for p in folder_key.replace('\\', '/').split('/')]
+        key_len = len(key_parts_lower)
+        # Ищем key_parts как непрерывную подпоследовательность path_parts
+        for i in range(len(path_parts_lower) - key_len + 1):
+            if path_parts_lower[i:i + key_len] == key_parts_lower:
+                if key_len > best_len:
+                    best_len = key_len
+                    best_match = (folder_key, preference)
                 break
-        parent = os.path.dirname(folder)
-        if parent == folder:
-            break
-        folder = parent
+
+    if best_match:
+        folder_key, preference = best_match
+        streams = get_audio_streams(video_path)
+        track = resolve_audio_track(streams, preference)
+        print(f"[{datetime.now()}] 🎵 Конфиг: '{folder_key}' → '{preference}' → дорожка {track}")
+        return track
+
     return AUDIO_TRACK
 
 

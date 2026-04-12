@@ -11,6 +11,7 @@ services:
     environment:
       - MTX_RTSPTRANSPORTS=tcp
       - MTX_LOGLEVEL=warn
+      - MTX_API=yes
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9997/v3/paths/list || exit 1"]
       interval: 3s
@@ -21,8 +22,12 @@ services:
   iptv-app:
     image: maksimignatov1337/myiptv:latest
     container_name: myiptv
+    environment:
+      - TZ=Europe/Moscow
     volumes:
       - ./videos:/app/videos
+      - /mnt/nas/torrents/cartoons/South Park:/app/videos/late_evening
+      - ./audio_config.myiptv:/app/audio_config.myiptv
     depends_on:
       mediamtx:
         condition: service_healthy
