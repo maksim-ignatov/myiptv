@@ -22,7 +22,9 @@ BASE_PATH = '/app'
 RTSP_URL = os.getenv('RTSP_URL', 'rtsp://mediamtx:8554/stream')
 
 FFMPEG_CMD_TEMPLATE = [
-    'ffmpeg', '-re', '-i', '',
+    'ffmpeg', '-re',
+    '-err_detect', 'ignore_err',  # tolerate minor errors in broken files
+    '-i', '',
 
     # Видео
     '-c:v', 'libx264',
@@ -49,6 +51,7 @@ FFMPEG_CMD_TEMPLATE = [
     '-avoid_negative_ts', 'make_zero',
     '-flush_packets', '1',
     '-max_muxing_queue_size', '1024',
+    '-ignore_unknown',  # ignore unknown streams (data tracks etc)
 
     # RTSP-вывод
     '-loglevel', 'warning',
@@ -56,6 +59,9 @@ FFMPEG_CMD_TEMPLATE = [
     '-rtsp_transport', 'tcp',
     RTSP_URL
 ]
+
+# Index of '-i' argument (input file placeholder)
+INPUT_INDEX = FFMPEG_CMD_TEMPLATE.index('-i') + 1
 
 current_process = None
 shutdown_event = threading.Event()
@@ -107,7 +113,7 @@ def play_video(video_path):
     global current_process
 
     cmd = FFMPEG_CMD_TEMPLATE[:]
-    cmd[3] = video_path
+    cmd[INPUT_INDEX] = video_path
 
     print(f"[{datetime.now()}] \u25b6 Запуск видео: {video_path}")
 
@@ -118,26 +124,34 @@ def play_video(video_path):
             universal_newlines=True
         )
 
-        error_event = threading.Event()
-        # Only patterns that reliably indicate a broken/unreadable file
-        error_keywords = ['corrupt', 'moov atom not found', 'invalid data found', 'no such file']
+        stderr_lines = []
+        fatal_event = threading.Event()
+        fatal_keywords = ['no such file or directory', 'moov atom not found', 'invalid data found']
 
-        def monitor_errors():
+        def monitor_stderr():
             for line in current_process.stderr:
-                if any(kw in line.lower() for kw in error_keywords):
-                    print(f"[{datetime.now()}] \u274c Обнаружена ошибка ffmpeg: {line.strip()}")
-                    error_event.set()
+                line = line.rstrip()
+                stderr_lines.append(line)
+                if any(kw in line.lower() for kw in fatal_keywords):
+                    print(f"[{datetime.now()}] \u274c Фатальная ошибка: {line}")
+                    fatal_event.set()
                     current_process.kill()
                     break
 
-        monitor_thread = threading.Thread(target=monitor_errors, daemon=True)
+        monitor_thread = threading.Thread(target=monitor_stderr, daemon=True)
         monitor_thread.start()
 
         current_process.wait()
         monitor_thread.join(timeout=2)
 
-        if error_event.is_set():
-            print(f"[{datetime.now()}] \U0001f501 Видео прервано из-за ошибки. Переходим к следующему.")
+        exit_code = current_process.returncode
+
+        if fatal_event.is_set() or exit_code not in (0, -9, -15):
+            print(f"[{datetime.now()}] \u274c Видео завершилось с ошибкой (exit code: {exit_code}): {os.path.basename(video_path)}")
+            if stderr_lines:
+                print(f"[{datetime.now()}] FFmpeg вывод:")
+                for line in stderr_lines[-15:]:
+                    print(f"    {line}")
             return False
 
         print(f"[{datetime.now()}] \u23f9 Видео завершилось: {video_path}")
@@ -168,7 +182,7 @@ def continuous_playback():
 
         unplayed = [v for v in all_videos if v not in played_videos[current_category]]
         if not unplayed:
-            print(f"[{datetime.now()}] \u2705 Все видео в {current_category} были воспроизведены. Сброс.")
+            print(f"[{datetime.now()}] \u2705 Все видео в {current_category} воспроизведены. Сброс.")
             played_videos[current_category].clear()
             unplayed = all_videos[:]
 
