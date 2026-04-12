@@ -22,6 +22,12 @@ services:
   iptv-app:
     image: maksimignatov1337/myiptv:latest
     container_name: myiptv
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1 && test -S /tmp/iptv_pipe.ts || test -p /tmp/iptv_pipe.ts"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     environment:
       - TZ=Europe/Moscow
       # VIDEOS_BASE=/app/videos  # путь к папке с видео (по умолчанию /app/videos)
@@ -30,7 +36,7 @@ services:
     volumes:
       - /mnt/nas/torrents/cartoons:/app/videos   # все шоу доступны как /app/videos/<название папки>
       - ./config.myiptv:/app/config.myiptv
-      # ./assets:/app/assets  # раскомментировать чтобы переопределить логотип без пересборки образа
+      # - ./assets:/app/assets  # раскомментировать чтобы переопределить логотип без пересборки образа
       - ./data:/app/data                         # история просмотров (played.json)
     depends_on:
       mediamtx:

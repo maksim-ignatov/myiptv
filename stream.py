@@ -4,207 +4,41 @@ import json
 import os
 import random
 import signal
+import subprocess
 import threading
 import time
 from datetime import datetime
-import subprocess
 
 BASE_PATH = '/app'
 RTSP_URL = os.getenv('RTSP_URL', 'rtsp://mediamtx:8554/stream')
-AUDIO_TRACK = int(os.getenv('AUDIO_TRACK', '0'))  # fallback если дорожка не найдена
+AUDIO_TRACK = int(os.getenv('AUDIO_TRACK', '0'))
 VIDEOS_BASE = os.getenv('VIDEOS_BASE', os.path.join(BASE_PATH, 'videos'))
 CONFIG_FILE = os.path.join(BASE_PATH, 'config.myiptv')
 PLAYED_FILE = os.path.join(BASE_PATH, 'data', 'played.json')
+FIFO_PATH = '/tmp/iptv_pipe.ts'
 
-# Если ffmpeg завершился быстрее этого порога — скорее всего RTSP недоступен,
-# а не проблема в файле. Видео НЕ помечаем как воспроизведённое.
 FAST_FAIL_THRESHOLD = 5.0
 
 SLOTS = ('early_morning', 'morning', 'late_morning', 'afternoon',
          'evening', 'late_evening', 'night', 'late_night')
 
-FFMPEG_BASE_ARGS = [
-    # Видео
-    '-c:v', 'libx264',
-    '-preset', 'veryfast',
-    '-x264-params', 'repeat-headers=1',
-    '-crf', '23',
-    '-maxrate', '2000k',
-    '-bufsize', '500k',
+LOGO_POSITIONS = {
+    'top-left':     '10:10',
+    'top-right':    'W-w-10:10',
+    'bottom-left':  '10:H-h-10',
+    'bottom-right': 'W-w-10:H-h-10',
+}
 
-    # Аудио
-    '-c:a', 'aac',
-    '-b:a', '128k',
-    '-ar', '44100',
-    '-ac', '2',
-
-    # Поток
-    '-pix_fmt', 'yuv420p',
-    '-g', '25',
-    '-keyint_min', '25',
-    '-sc_threshold', '0',
-
-    # Поведение
-    '-fflags', '+genpts+flush_packets+nobuffer',
-    '-avoid_negative_ts', 'make_zero',
-    '-flush_packets', '1',
-    '-max_muxing_queue_size', '1024',
-    '-ignore_unknown',
-
-    # RTSP-вывод
-    '-loglevel', 'warning',
-    '-f', 'rtsp',
-    '-rtsp_transport', 'tcp',
-    RTSP_URL
-]
-
-
-def build_ffmpeg_cmd(video_path, audio_track, settings):
-    """Собирает команду ffmpeg. Если задан логотип — добавляет overlay."""
-    raw = settings.get('logo', '').strip()
-    logo_path = raw if os.path.isabs(raw) else (os.path.join(BASE_PATH, raw) if raw else '')
-
-    position_key = settings.get('logo_position', 'bottom-left')
-    overlay_pos = LOGO_POSITIONS.get(position_key, LOGO_POSITIONS['bottom-left'])
-
-    if _logo_exists(logo_path):
-        cmd = [
-            'ffmpeg', '-re',
-            '-err_detect', 'ignore_err',
-            '-i', video_path,
-            '-i', logo_path,
-            '-filter_complex', f'[0:v][1:v]overlay={overlay_pos}',
-            '-map', '0:a:' + str(audio_track),
-        ]
-    else:
-        cmd = [
-            'ffmpeg', '-re',
-            '-err_detect', 'ignore_err',
-            '-i', video_path,
-            '-map', '0:v:0',
-            '-map', '0:a:' + str(audio_track),
-        ]
-    return cmd + FFMPEG_BASE_ARGS
-
-current_process = None
 shutdown_event = threading.Event()
-# played_videos[(slot, show_name)] = set of video paths
-# show_name — первый компонент пути папки из конфига (т.е. "South Park", а не "South Park/Season 1")
 played_videos = {}
+outer_process = None
 
 
-def load_played():
-    """Загружает историю просмотров из файла при старте."""
-    global played_videos
-    try:
-        with open(PLAYED_FILE, encoding='utf-8') as f:
-            data = json.load(f)
-        # JSON хранит ключи как "slot|show", значения как списки → конвертируем обратно
-        played_videos = {tuple(k.split('|', 1)): set(v) for k, v in data.items()}
-        total = sum(len(v) for v in played_videos.values())
-        print(f"[{datetime.now()}] 📂 История загружена: {total} просмотренных серий")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"[{datetime.now()}] ⚠ Не удалось загрузить историю: {e}")
-
-
-def save_played():
-    """Сохраняет историю просмотров на диск."""
-    try:
-        os.makedirs(os.path.dirname(PLAYED_FILE), exist_ok=True)
-        data = {'|'.join(k): list(v) for k, v in played_videos.items()}
-        with open(PLAYED_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[{datetime.now()}] ⚠ Не удалось сохранить историю: {e}")
-
-
-def print_schedule_summary(config):
-    """#1 — сводка расписания при старте + #5 — предупреждение о пустых слотах."""
-    print("📋 Расписание:")
-    has_any = False
-    for slot in SLOTS:
-        entries = config.get(slot, []) + config.get('*', [])
-        if not entries:
-            continue
-        parts = []
-        for entry in entries:
-            show_name = entry['folder'].replace('\\', '/').split('/')[0]
-            folder_path = os.path.join(VIDEOS_BASE, entry['folder'])
-            count = len(find_videos(folder_path))
-            parts.append(f"{show_name} ({count} серий)")
-        if parts:
-            print(f"   {slot:15s} → {', '.join(parts)}")
-            has_any = True
-
-    wildcard = config.get('*', [])
-    if wildcard:
-        parts = []
-        for entry in wildcard:
-            show_name = entry['folder'].replace('\\', '/').split('/')[0]
-            folder_path = os.path.join(VIDEOS_BASE, entry['folder'])
-            count = len(find_videos(folder_path))
-            parts.append(f"{show_name} ({count} серий)")
-        print(f"   {'[всегда]':15s} → {', '.join(parts)}")
-        has_any = True
-
-    if not has_any:
-        print("   (нет настроенных шоу — заполните config.myiptv)")
-
-    settings = config.get('settings', {})
-    raw = settings.get('logo', '').strip()
-    logo_path = raw if os.path.isabs(raw) else (os.path.join(BASE_PATH, raw) if raw else '')
-    position = settings.get('logo_position', 'bottom-left')
-    if _logo_exists(logo_path):
-        print(f"   🖼 Логотип: {logo_path} ({position})")
-    elif logo_path:
-        print(f"   🖼 Логотип: ⚠ файл не найден ({logo_path})")
-    else:
-        print(f"   🖼 Логотип: отключён")
-
-    # #5 — пустые слоты с настроенными, но ненайденными папками
-    for slot in SLOTS:
-        for entry in config.get(slot, []):
-            folder_path = os.path.join(VIDEOS_BASE, entry['folder'])
-            if not os.path.isdir(folder_path):
-                print(f"   ⚠ [{slot}] папка не найдена: {folder_path}")
-    print()
-
-
-def handle_shutdown(_signum, _frame):
-    print(f"\n[{datetime.now()}] 🛑 Получен сигнал завершения, останавливаем...")
-    shutdown_event.set()
-    if current_process and current_process.poll() is None:
-        current_process.terminate()
-
-
-signal.signal(signal.SIGTERM, handle_shutdown)
-signal.signal(signal.SIGINT, handle_shutdown)
-
-
-def get_current_category():
-    hour = datetime.now().hour
-    if 5 <= hour < 7:
-        return 'early_morning'
-    elif 7 <= hour < 10:
-        return 'morning'
-    elif 10 <= hour < 12:
-        return 'late_morning'
-    elif 12 <= hour < 15:
-        return 'afternoon'
-    elif 15 <= hour < 18:
-        return 'evening'
-    elif 18 <= hour < 21:
-        return 'late_evening'
-    elif 21 <= hour < 24:
-        return 'night'
-    else:  # 0-5
-        return 'late_night'
-
+# ---------------------------------------------------------------------------
+# Утилиты
+# ---------------------------------------------------------------------------
 
 def _logo_exists(path):
-    """Проверяет доступность файла через open() — работает даже на NTFS/WSL где stat() возвращает ?."""
     if not path:
         return False
     try:
@@ -214,29 +48,28 @@ def _logo_exists(path):
         return False
 
 
-LOGO_POSITIONS = {
-    'top-left':     '10:10',
-    'top-right':    'W-w-10:10',
-    'bottom-left':  '10:H-h-10',
-    'bottom-right': 'W-w-10:H-h-10',
-}
+def get_current_category():
+    hour = datetime.now().hour
+    if 5 <= hour < 7:   return 'early_morning'
+    elif 7 <= hour < 10: return 'morning'
+    elif 10 <= hour < 12: return 'late_morning'
+    elif 12 <= hour < 15: return 'afternoon'
+    elif 15 <= hour < 18: return 'evening'
+    elif 18 <= hour < 21: return 'late_evening'
+    elif 21 <= hour < 24: return 'night'
+    else:                 return 'late_night'
 
+
+# ---------------------------------------------------------------------------
+# Конфиг
+# ---------------------------------------------------------------------------
 
 def load_config():
-    """
-    Парсит config.myiptv.
-    Возвращает dict:
-      'settings': {'logo': str, 'logo_position': str}
-      slot: [{'folder': str, 'audio': str}]
-      '*': [...]  — папки без временного слота (играют в любое время)
-    """
     result = {slot: [] for slot in SLOTS}
     result['*'] = []
     result['settings'] = {}
-
     if not os.path.isfile(CONFIG_FILE):
         return result
-
     current_section = '*'
     try:
         with open(CONFIG_FILE, encoding='utf-8') as f:
@@ -264,16 +97,6 @@ def load_config():
 
 
 def get_shows_for_slot(slot, config):
-    """
-    Возвращает (show_videos, audio_map) для текущего слота.
-
-    show_videos: {show_name: [video_paths]}
-      show_name — первый компонент пути из конфига ("South Park", не "South Park/Season 1").
-      Все сезоны одного шоу объединяются под одним ключом → равные шансы между шоу.
-
-    audio_map: {folder_key: audio_pref}
-      folder_key может быть как "South Park", так и "South Park/Season 1" — побеждает длиннее.
-    """
     entries = config.get(slot, []) + config.get('*', [])
     show_videos = {}
     audio_map = {}
@@ -299,8 +122,39 @@ def find_videos(folder):
     return videos
 
 
+# ---------------------------------------------------------------------------
+# История просмотров
+# ---------------------------------------------------------------------------
+
+def load_played():
+    global played_videos
+    try:
+        with open(PLAYED_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        played_videos = {tuple(k.split('|', 1)): set(v) for k, v in data.items()}
+        total = sum(len(v) for v in played_videos.values())
+        print(f"[{datetime.now()}] 📂 История загружена: {total} просмотренных серий")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[{datetime.now()}] ⚠ Не удалось загрузить историю: {e}")
+
+
+def save_played():
+    try:
+        os.makedirs(os.path.dirname(PLAYED_FILE), exist_ok=True)
+        data = {'|'.join(k): list(v) for k, v in played_videos.items()}
+        with open(PLAYED_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[{datetime.now()}] ⚠ Не удалось сохранить историю: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Аудиодорожки
+# ---------------------------------------------------------------------------
+
 def get_audio_streams(video_path):
-    """Возвращает список дорожек: [{'index': 0, 'lang': 'rus', 'title': '...'}]"""
     try:
         result = subprocess.run(
             ['ffprobe', '-v', 'error',
@@ -328,24 +182,12 @@ def get_audio_streams(video_path):
 
 
 def resolve_audio_track(streams, preference):
-    """
-    Находит индекс дорожки по предпочтению:
-      'Рен-ТВ'   → ищет по title (частичное совпадение, без регистра)
-      'rus'      → первая дорожка с языком rus
-      'rus:2'    → вторая дорожка с языком rus
-      '1'        → дорожка с индексом 1
-    """
     if not streams:
         return AUDIO_TRACK
-
     pref = preference.strip()
-
-    # Число — прямой индекс
     if pref.isdigit():
         idx = int(pref)
         return idx if idx < len(streams) else AUDIO_TRACK
-
-    # lang:N — N-й по счёту (1-based) с нужным языком
     if ':' in pref:
         lang, _, n = pref.partition(':')
         lang = lang.strip().lower()
@@ -356,37 +198,24 @@ def resolve_audio_track(streams, preference):
         matches = [s for s in streams if s['lang'].lower() == lang]
         if matches and n <= len(matches):
             return matches[n - 1]['index']
-        print(f"[{datetime.now()}] ⚠ Дорожка '{preference}' не найдена (найдено {len(matches)} '{lang}'-дорожек), используем дефолт")
+        print(f"[{datetime.now()}] ⚠ Дорожка '{preference}' не найдена, используем дефолт")
         return AUDIO_TRACK
-
-    # Просто язык — первая подходящая дорожка
     lang_lower = pref.lower()
     for s in streams:
         if s['lang'].lower() == lang_lower:
             return s['index']
-
-    # Название перевода — поиск по title
     for s in streams:
         if pref.lower() in s['title'].lower():
             return s['index']
-
     return AUDIO_TRACK
 
 
 def get_audio_track(video_path, audio_map):
-    """
-    Определяет индекс аудиодорожки по audio_map из конфига.
-    Поддерживает подпапки: 'South Park/Season 3' более специфично, чем 'South Park'.
-    Побеждает самое длинное совпадение.
-    """
     if not audio_map:
         return AUDIO_TRACK
-
     path_parts_lower = [p.lower() for p in video_path.replace('\\', '/').split('/')]
-
     best_match = None
     best_len = 0
-
     for folder_key, preference in audio_map.items():
         key_parts_lower = [p.strip().lower() for p in folder_key.replace('\\', '/').split('/')]
         key_len = len(key_parts_lower)
@@ -396,11 +225,9 @@ def get_audio_track(video_path, audio_map):
                     best_len = key_len
                     best_match = (folder_key, preference)
                 break
-
     if best_match:
         folder_key, preference = best_match
         streams = get_audio_streams(video_path)
-        # #3 — список всех доступных дорожек
         if streams:
             tracks_str = '  '.join(
                 f"[{s['index']}] {s['lang'] or '?'}{(' ' + repr(s['title'])) if s['title'] else ''}"
@@ -410,84 +237,289 @@ def get_audio_track(video_path, audio_map):
         track = resolve_audio_track(streams, preference)
         print(f"[{datetime.now()}] 🎵 Выбрана: '{preference}' → дорожка {track}")
         return track
-
     return AUDIO_TRACK
 
 
-def play_video(video_path, audio_map, settings):
+# ---------------------------------------------------------------------------
+# Сводка расписания
+# ---------------------------------------------------------------------------
+
+def print_schedule_summary(config):
+    print("📋 Расписание:")
+    has_any = False
+    for slot in SLOTS:
+        entries = config.get(slot, []) + config.get('*', [])
+        if not entries:
+            continue
+        parts = []
+        for entry in entries:
+            show_name = entry['folder'].replace('\\', '/').split('/')[0]
+            folder_path = os.path.join(VIDEOS_BASE, entry['folder'])
+            count = len(find_videos(folder_path))
+            parts.append(f"{show_name} ({count} серий)")
+        if parts:
+            print(f"   {slot:15s} → {', '.join(parts)}")
+            has_any = True
+    wildcard = config.get('*', [])
+    if wildcard:
+        parts = []
+        for entry in wildcard:
+            show_name = entry['folder'].replace('\\', '/').split('/')[0]
+            folder_path = os.path.join(VIDEOS_BASE, entry['folder'])
+            count = len(find_videos(folder_path))
+            parts.append(f"{show_name} ({count} серий)")
+        print(f"   {'[всегда]':15s} → {', '.join(parts)}")
+        has_any = True
+    if not has_any:
+        print("   (нет настроенных шоу — заполните config.myiptv)")
+    settings = config.get('settings', {})
+    raw = settings.get('logo', '').strip()
+    logo_path = raw if os.path.isabs(raw) else (os.path.join(BASE_PATH, raw) if raw else '')
+    position = settings.get('logo_position', 'bottom-left')
+    if _logo_exists(logo_path):
+        print(f"   🖼 Логотип: {logo_path} ({position})")
+    elif logo_path:
+        print(f"   🖼 Логотип: ⚠ файл не найден ({logo_path})")
+    else:
+        print(f"   🖼 Логотип: отключён")
+    for slot in SLOTS:
+        for entry in config.get(slot, []):
+            folder_path = os.path.join(VIDEOS_BASE, entry['folder'])
+            if not os.path.isdir(folder_path):
+                print(f"   ⚠ [{slot}] папка не найдена: {folder_path}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Внешний ffmpeg (живёт всегда, читает FIFO → RTSP)
+# ---------------------------------------------------------------------------
+
+def build_outer_cmd(_settings):
     """
-    Returns:
-      True  — видео успешно воспроизведено
-      False — ошибка в файле, пропустить
-      None  — быстрый сбой (RTSP недоступен), не помечать файл как воспроизведённый
+    Внешний ffmpeg: читает FIFO-pipe (уже закодированный TS с логотипом),
+    пушит в RTSP без перекодирования — нулевая нагрузка на CPU.
     """
-    global current_process
+    return [
+        'ffmpeg', '-y',
+        '-fflags', '+genpts+discardcorrupt+nobuffer',
+        '-i', FIFO_PATH,
+        '-c:v', 'copy',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+        '-fflags', '+genpts+flush_packets+nobuffer',
+        '-avoid_negative_ts', 'make_zero',
+        '-flush_packets', '1',
+        '-max_muxing_queue_size', '1024',
+        '-ignore_unknown',
+        '-loglevel', 'warning',
+        '-f', 'rtsp', '-rtsp_transport', 'tcp',
+        RTSP_URL,
+    ]
 
-    track = get_audio_track(video_path, audio_map)
-    cmd = build_ffmpeg_cmd(video_path, track, settings)
-    logo_note = ' +лого' if cmd.count('-i') > 1 else ''
-    print(f"[{datetime.now()}] ▶ Запуск видео: {video_path} (аудио: {track}{logo_note})")
-    start_time = time.time()
 
-    try:
-        current_process = subprocess.Popen(
-            cmd,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
-        )
+def start_outer_ffmpeg(settings):
+    global outer_process
+    cmd = build_outer_cmd(settings)
+    print(f"[{datetime.now()}] 🟢 Внешний ffmpeg запущен (copy) → {RTSP_URL}")
+    outer_process = subprocess.Popen(cmd, stderr=subprocess.PIPE)
 
-        stderr_lines = []
-        fatal_keywords = ['no such file or directory', 'moov atom not found', 'invalid data found']
+    def log_stderr():
+        for line in outer_process.stderr:
+            line = line.decode(errors='replace').rstrip()
+            if line:
+                print(f"[outer] {line}")
+        # Поток stderr закрылся — outer ffmpeg завершился
+        rc = outer_process.poll()
+        if rc is not None and not shutdown_event.is_set():
+            print(f"[{datetime.now()}] 🔴 Внешний ffmpeg завершился (код {rc})")
 
-        def monitor_stderr():
-            for line in current_process.stderr:
-                line = line.rstrip()
-                stderr_lines.append(line)
-                if any(kw in line.lower() for kw in fatal_keywords):
-                    print(f"[{datetime.now()}] ❌ Фатальная ошибка: {line}")
-                    current_process.kill()
-                    break
+    threading.Thread(target=log_stderr, daemon=True).start()
+    return outer_process
 
-        monitor_thread = threading.Thread(target=monitor_stderr, daemon=True)
-        monitor_thread.start()
 
-        current_process.wait()
-        monitor_thread.join(timeout=2)
+# ---------------------------------------------------------------------------
+# Внутренний ffmpeg: видеофайл → FIFO (MPEGTS, без звука re-encode)
+# ---------------------------------------------------------------------------
 
-        exit_code = current_process.returncode
-        duration = time.time() - start_time
+INNER_TS_ARGS = [
+    # Видео
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-x264-params', 'repeat-headers=1',
+    '-crf', '23',
+    '-maxrate', '2000k',
+    '-bufsize', '500k',
+    # Аудио — global_header чтобы outer ffmpeg мог copy в RTSP без перекодирования
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-ar', '44100',
+    '-ac', '2',
+    # Поток
+    '-pix_fmt', 'yuv420p',
+    '-g', '25', '-keyint_min', '25', '-sc_threshold', '0',
+    '-fflags', '+genpts+flush_packets+nobuffer',
+    '-avoid_negative_ts', 'make_zero',
+    '-flush_packets', '1',
+    '-max_muxing_queue_size', '1024',
+    '-ignore_unknown',
+    '-loglevel', 'warning',
+    '-f', 'mpegts',
+    FIFO_PATH,
+]
 
-        # Нормальное завершение или killed сигналом (SIGKILL/SIGTERM)
-        if exit_code in (0, -9, -15):
-            # #4 — длительность воспроизведения
-            mins, secs = divmod(int(duration), 60)
-            print(f"[{datetime.now()}] ⏹ Завершено за {mins}м {secs:02d}с: {os.path.basename(video_path)}")
-            return True
 
-        # Быстрый сбой — RTSP скорее всего недоступен, файл не виноват
-        if duration < FAST_FAIL_THRESHOLD:
-            print(f"[{datetime.now()}] ⚠ Быстрый сбой за {duration:.1f}с (exit: {exit_code}) — возможно RTSP недоступен")
-            if stderr_lines:
-                for line in stderr_lines[-5:]:
-                    print(f"    {line}")
-            return None
+def build_inner_cmd(video_path, audio_track, settings):
+    """Кодирует видео → MPEGTS в FIFO. Логотип накладывается здесь."""
+    raw = settings.get('logo', '').strip()
+    logo_path = raw if os.path.isabs(raw) else (os.path.join(BASE_PATH, raw) if raw else '')
+    position_key = settings.get('logo_position', 'bottom-left')
+    overlay_pos = LOGO_POSITIONS.get(position_key, LOGO_POSITIONS['bottom-left'])
 
-        # Медленный сбой — проблема в файле
-        print(f"[{datetime.now()}] ❌ Ошибка в файле (exit: {exit_code}, {duration:.1f}с): {os.path.basename(video_path)}")
-        if stderr_lines:
-            print(f"[{datetime.now()}] FFmpeg вывод:")
-            for line in stderr_lines[-15:]:
-                print(f"    {line}")
-        return False
+    if _logo_exists(logo_path):
+        return [
+            'ffmpeg', '-y', '-re',
+            '-err_detect', 'ignore_err',
+            '-i', video_path,
+            '-i', logo_path,
+            '-filter_complex', f'[0:v][1:v]overlay={overlay_pos}',
+            '-map', '0:a:' + str(audio_track),
+        ] + INNER_TS_ARGS
+    else:
+        return [
+            'ffmpeg', '-y', '-re',
+            '-err_detect', 'ignore_err',
+            '-i', video_path,
+            '-map', '0:v:0',
+            '-map', '0:a:' + str(audio_track),
+        ] + INNER_TS_ARGS
 
-    except Exception as e:
-        print(f"[{datetime.now()}] ⚠ Ошибка при запуске ffmpeg: {e}")
-        return None
+
+# ---------------------------------------------------------------------------
+# Чёрный экран: генерация через lavfi → FIFO
+# ---------------------------------------------------------------------------
+
+def _run_blackscreen(duration=30):
+    proc = subprocess.Popen(build_blackscreen_cmd(duration), stderr=subprocess.PIPE)
+
+    def log_stderr():
+        for line in proc.stderr:
+            line = line.decode(errors='replace').rstrip()
+            if line:
+                print(f"[blackscreen] {line}")
+
+    threading.Thread(target=log_stderr, daemon=True).start()
+    while proc.poll() is None and not shutdown_event.is_set():
+        time.sleep(1)
+    rc = proc.poll()
+    if rc is None:
+        proc.terminate()
+    else:
+        print(f"[{datetime.now()}] 🌑 Чёрный экран завершился (код {rc})")
+
+
+def build_blackscreen_cmd(duration=30):
+    """Генерирует чёрный экран 1920x1080 25fps в FIFO на duration секунд."""
+    return [
+        'ffmpeg', '-y',
+        '-f', 'lavfi', '-i', f'color=black:size=1920x1080:rate=25:duration={duration}',
+        '-f', 'lavfi', '-i', f'anullsrc=r=44100:cl=stereo',
+        '-t', str(duration),
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+        '-c:a', 'aac', '-b:a', '64k',
+        '-pix_fmt', 'yuv420p',
+        '-g', '25', '-keyint_min', '25',
+        '-fflags', '+genpts+flush_packets+nobuffer',
+        '-flush_packets', '1',
+        '-loglevel', 'warning',
+        '-f', 'mpegts',
+        FIFO_PATH,
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Сигналы завершения
+# ---------------------------------------------------------------------------
+
+def handle_shutdown(_signum, _frame):
+    print(f"\n[{datetime.now()}] 🛑 Получен сигнал завершения, останавливаем...")
+    shutdown_event.set()
+    if outer_process and outer_process.poll() is None:
+        outer_process.terminate()
+
+
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
+
+
+# ---------------------------------------------------------------------------
+# Основной цикл воспроизведения
+# ---------------------------------------------------------------------------
+
+def run_inner(cmd, label):
+    """
+    Запускает внутренний ffmpeg, ждёт завершения.
+    Возвращает (exit_code, duration).
+    """
+    start = time.time()
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+    stderr_lines = []
+    fatal_kw = ['no such file or directory', 'moov atom not found', 'invalid data found']
+
+    def read_stderr():
+        for line in proc.stderr:
+            line = line.decode(errors='replace').rstrip()
+            stderr_lines.append(line)
+            if any(kw in line.lower() for kw in fatal_kw):
+                print(f"[{datetime.now()}] ❌ Фатальная ошибка: {line}")
+                proc.kill()
+
+    t = threading.Thread(target=read_stderr, daemon=True)
+    t.start()
+    proc.wait()
+    t.join(timeout=2)
+    duration = time.time() - start
+    if proc.returncode not in (0, -9, -15) and stderr_lines:
+        print(f"[{datetime.now()}] FFmpeg ({label}) вывод:")
+        for line in stderr_lines[-10:]:
+            print(f"    {line}")
+    return proc.returncode, duration
+
+
+def _outer_watchdog(settings_ref):
+    """Фоновый поток — следит за внешним ffmpeg, при падении перезапускает немедленно."""
+    while not shutdown_event.is_set():
+        shutdown_event.wait(timeout=1)
+        if shutdown_event.is_set():
+            break
+        if outer_process and outer_process.poll() is not None:
+            print(f"[{datetime.now()}] ⚠ Watchdog: внешний ffmpeg упал (код {outer_process.returncode}), перезапуск...")
+            start_outer_ffmpeg(settings_ref[0])
+            shutdown_event.wait(timeout=2)
 
 
 def continuous_playback():
     current_slot = get_current_category()
     print(f"[{datetime.now()}] ▶ Начинаем показ категории: {current_slot}")
+
+    # Создаём FIFO
+    if os.path.exists(FIFO_PATH):
+        os.remove(FIFO_PATH)
+    os.mkfifo(FIFO_PATH)
+    print(f"[{datetime.now()}] 📡 FIFO создан: {FIFO_PATH}")
+
+    # Открываем FIFO сами в режиме O_RDWR — "якорный" дескриптор.
+    # Пока он открыт, читатель (внешний ffmpeg) никогда не получит EOF.
+    fifo_anchor_fd = os.open(FIFO_PATH, os.O_RDWR | os.O_NONBLOCK)
+    print(f"[{datetime.now()}] 🔗 FIFO anchor открыт (fd={fifo_anchor_fd})")
+
+    config = load_config()
+    settings = config.get('settings', {})
+    settings_ref = [settings]
+
+    start_outer_ffmpeg(settings)
+    time.sleep(1)
+
+    threading.Thread(target=_outer_watchdog, args=(settings_ref,), daemon=True).start()
+    print(f"[{datetime.now()}] 👁 Watchdog запущен")
 
     while not shutdown_event.is_set():
         new_slot = get_current_category()
@@ -497,16 +529,19 @@ def continuous_playback():
 
         config = load_config()
         settings = config.get('settings', {})
+        settings_ref[0] = settings
         show_videos, audio_map = get_shows_for_slot(current_slot, config)
 
         if not show_videos:
-            print(f"[{datetime.now()}] ⚠ Нет видео для категории: {current_slot}")
-            shutdown_event.wait(timeout=10)
+            print(f"[{datetime.now()}] 🌑 Нет видео для [{current_slot}] — чёрный экран 30с")
+            _run_blackscreen(30)
             continue
 
-        # Для каждого шоу — список непросмотренных серий
+        # Выбираем следующую серию
         available = {}
         for show, vids in show_videos.items():
+            if not vids:
+                continue
             key = (current_slot, show)
             seen = played_videos.get(key, set())
             unplayed = [v for v in vids if v not in seen]
@@ -516,34 +551,77 @@ def continuous_playback():
                 unplayed = vids[:]
             available[show] = unplayed
 
-        # Сначала случайное шоу, потом случайная серия — равные шансы между шоу
+        if not available:
+            print(f"[{datetime.now()}] 🌑 Нет доступных видео для [{current_slot}] — чёрный экран 30с")
+            _run_blackscreen(30)
+            continue
+
         chosen_show = random.choice(list(available.keys()))
         video_path = random.choice(available[chosen_show])
 
-        # #2 — прогресс шоу
         total = len(show_videos[chosen_show])
         seen_count = len(played_videos.get((current_slot, chosen_show), set()))
         pct = int(seen_count / total * 100) if total else 0
         print(f"[{datetime.now()}] 🟡 [{chosen_show}] {os.path.basename(video_path)}  ({seen_count}/{total}, {pct}%)")
-        result = play_video(video_path, audio_map, settings)
 
-        key = (current_slot, chosen_show)
-        if result is True:
+        track = get_audio_track(video_path, audio_map)
+        cmd = build_inner_cmd(video_path, track, settings)
+        raw = settings.get('logo', '').strip()
+        logo_path = raw if os.path.isabs(raw) else (os.path.join(BASE_PATH, raw) if raw else '')
+        logo_note = ' +лого' if _logo_exists(logo_path) else ''
+        print(f"[{datetime.now()}] ▶ Запуск: {os.path.basename(video_path)} (аудио: {track}{logo_note})")
+
+        exit_code, duration = run_inner(cmd, os.path.basename(video_path))
+        mins, secs = divmod(int(duration), 60)
+
+        if exit_code in (0, -9, -15):
+            print(f"[{datetime.now()}] ⏹ Завершено за {mins}м {secs:02d}с: {os.path.basename(video_path)}")
+            key = (current_slot, chosen_show)
             played_videos.setdefault(key, set()).add(video_path)
             save_played()
-        elif result is False:
-            played_videos.setdefault(key, set()).add(video_path)
-            save_played()
-            print(f"[{datetime.now()}] ⚠ Пропускаем битый файл: {os.path.basename(video_path)}\n")
-        elif result is None:
-            print(f"[{datetime.now()}] ⏳ Ждём 5с перед повтором (RTSP?)...")
+            # 2с чёрного экрана между сериями — заполняет паузу пока следующий inner стартует
+            _run_blackscreen(2)
+        elif duration < FAST_FAIL_THRESHOLD:
+            print(f"[{datetime.now()}] ⚠ Быстрый сбой за {duration:.1f}с (exit: {exit_code})")
             shutdown_event.wait(timeout=5)
+        else:
+            print(f"[{datetime.now()}] ❌ Ошибка в файле (exit: {exit_code}, {duration:.1f}с): {os.path.basename(video_path)}")
+            key = (current_slot, chosen_show)
+            played_videos.setdefault(key, set()).add(video_path)
+            save_played()
 
-        shutdown_event.wait(timeout=1)
 
+# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
+    # Логирование в файл с ротацией (10MB x 3 файла) + вывод в stdout
+    import logging
+    import logging.handlers
+
+    log_dir = os.path.join(BASE_PATH, 'data')
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, 'stream.log')
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=10 * 1024 * 1024, backupCount=3, encoding='utf-8'
+    )
+    file_handler.setFormatter(logging.Formatter('%(message)s'))
+    root_logger.addHandler(file_handler)
+
+    # Перенаправляем print в logging чтобы всё попадало и в файл и в stdout
+    import builtins
+    _orig_print = builtins.print
+    def _logging_print(*args, **kwargs):
+        msg = ' '.join(str(a) for a in args)
+        _orig_print(*args, **kwargs)
+        logging.info(msg)
+    builtins.print = _logging_print
+
     print("🚀 IPTV-поток запущен.\n")
+    print(f"📝 Лог: {log_file}")
     load_played()
     print_schedule_summary(load_config())
     continuous_playback()
