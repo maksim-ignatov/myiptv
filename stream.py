@@ -21,6 +21,7 @@ VIDEO_DIRS = {
 
 BASE_PATH = '/app'
 RTSP_URL = os.getenv('RTSP_URL', 'rtsp://mediamtx:8554/stream')
+AUDIO_TRACK = int(os.getenv('AUDIO_TRACK', '0'))
 
 # Если ffmpeg завершился быстрее этого порога — скорее всего RTSP недоступен,
 # а не проблема в файле. Видео НЕ помечаем как воспроизведённое.
@@ -30,6 +31,8 @@ FFMPEG_CMD_TEMPLATE = [
     'ffmpeg', '-re',
     '-err_detect', 'ignore_err',
     '-i', '',
+    '-map', '0:v:0',
+    '-map', '0:a:AUDIO_TRACK_PLACEHOLDER',
 
     # Видео
     '-c:v', 'libx264',
@@ -103,6 +106,28 @@ def get_current_category():
         return 'late_night'
 
 
+def get_audio_track(video_path):
+    """
+    Ищет файл .audio_track в папке с видео или в родительских папках
+    вплоть до BASE_PATH. Если найден — возвращает номер дорожки из него.
+    Иначе — значение env AUDIO_TRACK (по умолчанию 0).
+    """
+    folder = os.path.dirname(video_path)
+    while folder.startswith(BASE_PATH):
+        track_file = os.path.join(folder, '.audio_track')
+        if os.path.isfile(track_file):
+            try:
+                track = int(open(track_file).read().strip())
+                return track
+            except (ValueError, OSError):
+                break
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+    return AUDIO_TRACK
+
+
 def find_videos(folder):
     videos = []
     extensions = ('.mp4', '.mkv', '.avi', '.mpg', '.mov', '.ts')
@@ -124,8 +149,10 @@ def play_video(video_path):
 
     cmd = FFMPEG_CMD_TEMPLATE[:]
     cmd[INPUT_INDEX] = video_path
+    track = get_audio_track(video_path)
+    cmd[cmd.index('0:a:AUDIO_TRACK_PLACEHOLDER')] = f'0:a:{track}'
 
-    print(f"[{datetime.now()}] ▶ Запуск видео: {video_path}")
+    print(f"[{datetime.now()}] ▶ Запуск видео: {video_path} (аудио: {track})")
     start_time = time.time()
 
     try:
