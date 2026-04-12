@@ -4,6 +4,7 @@ import os
 import random
 import signal
 import threading
+import time
 from datetime import datetime
 import subprocess
 
@@ -21,9 +22,13 @@ VIDEO_DIRS = {
 BASE_PATH = '/app'
 RTSP_URL = os.getenv('RTSP_URL', 'rtsp://mediamtx:8554/stream')
 
+# Если ffmpeg завершился быстрее этого порога — скорее всего RTSP недоступен,
+# а не проблема в файле. Видео НЕ помечаем как воспроизведённое.
+FAST_FAIL_THRESHOLD = 5.0
+
 FFMPEG_CMD_TEMPLATE = [
     'ffmpeg', '-re',
-    '-err_detect', 'ignore_err',  # tolerate minor errors in broken files
+    '-err_detect', 'ignore_err',
     '-i', '',
 
     # Видео
@@ -51,7 +56,7 @@ FFMPEG_CMD_TEMPLATE = [
     '-avoid_negative_ts', 'make_zero',
     '-flush_packets', '1',
     '-max_muxing_queue_size', '1024',
-    '-ignore_unknown',  # ignore unknown streams (data tracks etc)
+    '-ignore_unknown',
 
     # RTSP-вывод
     '-loglevel', 'warning',
@@ -60,7 +65,6 @@ FFMPEG_CMD_TEMPLATE = [
     RTSP_URL
 ]
 
-# Index of '-i' argument (input file placeholder)
 INPUT_INDEX = FFMPEG_CMD_TEMPLATE.index('-i') + 1
 
 current_process = None
@@ -69,7 +73,7 @@ played_videos = {k: set() for k in VIDEO_DIRS}
 
 
 def handle_shutdown(signum, frame):
-    print(f"\n[{datetime.now()}] \U0001f6d1 Получен сигнал завершения, останавливаем...")
+    print(f"\n[{datetime.now()}] 🛑 Получен сигнал завершения, останавливаем...")
     shutdown_event.set()
     if current_process and current_process.poll() is None:
         current_process.terminate()
@@ -110,12 +114,19 @@ def find_videos(folder):
 
 
 def play_video(video_path):
+    """
+    Returns:
+      True  — видео успешно воспроизведено
+      False — ошибка в файле, пропустить
+      None  — быстрый сбой (RTSP недоступен), не помечать файл как воспроизведённый
+    """
     global current_process
 
     cmd = FFMPEG_CMD_TEMPLATE[:]
     cmd[INPUT_INDEX] = video_path
 
-    print(f"[{datetime.now()}] \u25b6 Запуск видео: {video_path}")
+    print(f"[{datetime.now()}] ▶ Запуск видео: {video_path}")
+    start_time = time.time()
 
     try:
         current_process = subprocess.Popen(
@@ -133,7 +144,7 @@ def play_video(video_path):
                 line = line.rstrip()
                 stderr_lines.append(line)
                 if any(kw in line.lower() for kw in fatal_keywords):
-                    print(f"[{datetime.now()}] \u274c Фатальная ошибка: {line}")
+                    print(f"[{datetime.now()}] ❌ Фатальная ошибка: {line}")
                     fatal_event.set()
                     current_process.kill()
                     break
@@ -145,61 +156,76 @@ def play_video(video_path):
         monitor_thread.join(timeout=2)
 
         exit_code = current_process.returncode
+        duration = time.time() - start_time
 
-        if fatal_event.is_set() or exit_code not in (0, -9, -15):
-            print(f"[{datetime.now()}] \u274c Видео завершилось с ошибкой (exit code: {exit_code}): {os.path.basename(video_path)}")
+        # Нормальное завершение или killed сигналом (SIGKILL/SIGTERM)
+        if exit_code in (0, -9, -15):
+            print(f"[{datetime.now()}] ⏹ Видео завершилось: {video_path}")
+            return True
+
+        # Быстрый сбой — RTSP скорее всего недоступен, файл не виноват
+        if duration < FAST_FAIL_THRESHOLD:
+            print(f"[{datetime.now()}] ⚠ Быстрый сбой за {duration:.1f}с (exit: {exit_code}) — возможно RTSP недоступен")
             if stderr_lines:
-                print(f"[{datetime.now()}] FFmpeg вывод:")
-                for line in stderr_lines[-15:]:
+                for line in stderr_lines[-5:]:
                     print(f"    {line}")
-            return False
+            return None  # не помечать файл как воспроизведённый
 
-        print(f"[{datetime.now()}] \u23f9 Видео завершилось: {video_path}")
-        return True
+        # Медленный сбой — проблема в файле
+        print(f"[{datetime.now()}] ❌ Ошибка в файле (exit: {exit_code}, {duration:.1f}с): {os.path.basename(video_path)}")
+        if stderr_lines:
+            print(f"[{datetime.now()}] FFmpeg вывод:")
+            for line in stderr_lines[-15:]:
+                print(f"    {line}")
+        return False
 
     except Exception as e:
-        print(f"[{datetime.now()}] \u26a0 Ошибка при запуске ffmpeg: {e}")
-        return False
+        print(f"[{datetime.now()}] ⚠ Ошибка при запуске ffmpeg: {e}")
+        return None
 
 
 def continuous_playback():
     current_category = get_current_category()
-    print(f"[{datetime.now()}] \u25b6 Начинаем показ категории: {current_category}")
+    print(f"[{datetime.now()}] ▶ Начинаем показ категории: {current_category}")
 
     while not shutdown_event.is_set():
         new_category = get_current_category()
         if new_category != current_category:
-            print(f"[{datetime.now()}] \U0001f504 Переход на новую категорию: {new_category}")
+            print(f"[{datetime.now()}] 🔄 Переход на новую категорию: {new_category}")
             current_category = new_category
 
         folder = os.path.join(BASE_PATH, VIDEO_DIRS[current_category])
         all_videos = find_videos(folder)
 
         if not all_videos:
-            print(f"[{datetime.now()}] \u26a0 Нет видео в папке: {folder}")
+            print(f"[{datetime.now()}] ⚠ Нет видео в папке: {folder}")
             shutdown_event.wait(timeout=10)
             continue
 
         unplayed = [v for v in all_videos if v not in played_videos[current_category]]
         if not unplayed:
-            print(f"[{datetime.now()}] \u2705 Все видео в {current_category} воспроизведены. Сброс.")
+            print(f"[{datetime.now()}] ✅ Все видео в {current_category} воспроизведены. Сброс.")
             played_videos[current_category].clear()
             unplayed = all_videos[:]
 
         video_path = random.choice(unplayed)
+        print(f"[{datetime.now()}] 🟡 Воспроизводим: {video_path}")
+        result = play_video(video_path)
 
-        print(f"[{datetime.now()}] \U0001f7e1 Пытаемся воспроизвести: {video_path}")
-        success = play_video(video_path)
-
-        # Mark as played regardless — on error, skip to next video next iteration
-        played_videos[current_category].add(video_path)
-
-        if not success:
-            print(f"[{datetime.now()}] \u26a0 Ошибка с {video_path} — пробуем следующее...\n")
+        if result is True:
+            played_videos[current_category].add(video_path)
+        elif result is False:
+            # Файл битый — пометить чтобы не повторять
+            played_videos[current_category].add(video_path)
+            print(f"[{datetime.now()}] ⚠ Пропускаем битый файл: {os.path.basename(video_path)}\n")
+        elif result is None:
+            # RTSP недоступен — НЕ помечаем файл, ждём перед повтором
+            print(f"[{datetime.now()}] ⏳ Ждём 5с перед повтором (RTSP?)...")
+            shutdown_event.wait(timeout=5)
 
         shutdown_event.wait(timeout=1)
 
 
 if __name__ == '__main__':
-    print("\U0001f680 IPTV-поток запущен. Ожидаем видео...\n")
+    print("🚀 IPTV-поток запущен. Ожидаем видео...\n")
     continuous_playback()

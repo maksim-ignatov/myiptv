@@ -3,26 +3,29 @@ services:
     image: bluenviron/mediamtx:latest-ffmpeg
     container_name: mediamtx
     ports:
-      - "8890:8890"
       - "8554:8554"
-      - "9710:9710"
-      - "1935:1935"
       - "8889:8889"
     networks:
       - iptv-net
     restart: unless-stopped
     environment:
       - MTX_RTSPTRANSPORTS=tcp
-      - MTX_LOGLEVEL=debug
+      - MTX_LOGLEVEL=warn
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9997/v3/paths/list || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
 
   iptv-app:
     image: maksimignatov1337/myiptv:latest
     container_name: myiptv
     volumes:
       - ./videos:/app/videos
-      - /mnt:/mnt
     depends_on:
-      - mediamtx
+      mediamtx:
+        condition: service_healthy
     networks:
       - iptv-net
     restart: unless-stopped
