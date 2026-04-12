@@ -2,10 +2,10 @@
 
 import os
 import random
-import time
-import subprocess
+import signal
 import threading
 from datetime import datetime
+import subprocess
 
 VIDEO_DIRS = {
     'early_morning': 'videos/early_morning',  # 5-7
@@ -19,6 +19,7 @@ VIDEO_DIRS = {
 }
 
 BASE_PATH = '/app'
+RTSP_URL = os.getenv('RTSP_URL', 'rtsp://mediamtx:8554/stream')
 
 FFMPEG_CMD_TEMPLATE = [
     'ffmpeg', '-re', '-i', '',
@@ -26,7 +27,6 @@ FFMPEG_CMD_TEMPLATE = [
     # Видео
     '-c:v', 'libx264',
     '-preset', 'veryfast',
-    '-tune', 'zerolatency',
     '-x264-params', 'repeat-headers=1',
     '-crf', '23',
     '-maxrate', '2000k',
@@ -54,21 +54,23 @@ FFMPEG_CMD_TEMPLATE = [
     '-loglevel', 'warning',
     '-f', 'rtsp',
     '-rtsp_transport', 'tcp',
-    'rtsp://mediamtx:8554/stream'
+    RTSP_URL
 ]
 
-
 current_process = None
-played_videos = {
-    'early_morning': set(),
-    'morning': set(),
-    'late_morning': set(),
-    'afternoon': set(),
-    'evening': set(),
-    'late_evening': set(),
-    'night': set(),
-    'late_night': set()
-}
+shutdown_event = threading.Event()
+played_videos = {k: set() for k in VIDEO_DIRS}
+
+
+def handle_shutdown(signum, frame):
+    print(f"\n[{datetime.now()}] \U0001f6d1 Получен сигнал завершения, останавливаем...")
+    shutdown_event.set()
+    if current_process and current_process.poll() is None:
+        current_process.terminate()
+
+
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
 
 
 def get_current_category():
@@ -93,11 +95,11 @@ def get_current_category():
 
 def find_videos(folder):
     videos = []
+    extensions = ('.mp4', '.mkv', '.avi', '.mpg', '.mov', '.ts')
     for root, _, files in os.walk(folder, followlinks=True):
         for file in files:
-            if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mpg', '.mov', '.AVI', '.ts')):
-                full_path = os.path.join(root, file)
-                videos.append(full_path)
+            if file.lower().endswith(extensions):
+                videos.append(os.path.join(root, file))
     return videos
 
 
@@ -107,90 +109,83 @@ def play_video(video_path):
     cmd = FFMPEG_CMD_TEMPLATE[:]
     cmd[3] = video_path
 
-    print(f"[{datetime.now()}] ▶ Запуск видео: {video_path}")
+    print(f"[{datetime.now()}] \u25b6 Запуск видео: {video_path}")
 
     try:
-        # Запускаем ffmpeg и читаем stderr
         current_process = subprocess.Popen(
             cmd,
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
 
-        error_detected = False
-        keywords = ['error', 'invalid', 'corrupt', 'broken', 'non-monotonous', 'mismatch', 'decode', 'incomplete', 'unavailable']
+        error_event = threading.Event()
+        # Only patterns that reliably indicate a broken/unreadable file
+        error_keywords = ['corrupt', 'moov atom not found', 'invalid data found', 'no such file']
 
         def monitor_errors():
-            nonlocal error_detected
             for line in current_process.stderr:
-                line_lower = line.lower()
-                if any(keyword in line_lower for keyword in keywords):
-                    print(f"[{datetime.now()}] ❌ Обнаружена ошибка ffmpeg: {line.strip()}")
-                    error_detected = True
+                if any(kw in line.lower() for kw in error_keywords):
+                    print(f"[{datetime.now()}] \u274c Обнаружена ошибка ffmpeg: {line.strip()}")
+                    error_event.set()
                     current_process.kill()
                     break
 
-        # Запускаем мониторинг ошибок в отдельном потоке
-        monitor_thread = threading.Thread(target=monitor_errors)
+        monitor_thread = threading.Thread(target=monitor_errors, daemon=True)
         monitor_thread.start()
 
-        current_process.wait()  # Ждём завершения ffmpeg
-        monitor_thread.join()
+        current_process.wait()
+        monitor_thread.join(timeout=2)
 
-        if error_detected:
-            print(f"[{datetime.now()}] 🔁 Видео прервано из-за ошибки. Переходим к следующему.")
-            return False  # Ошибка — перейти к следующему видео
+        if error_event.is_set():
+            print(f"[{datetime.now()}] \U0001f501 Видео прервано из-за ошибки. Переходим к следующему.")
+            return False
 
-        print(f"[{datetime.now()}] ⏹ Видео завершилось: {video_path}")
-        return True  # Успешно проиграно до конца
+        print(f"[{datetime.now()}] \u23f9 Видео завершилось: {video_path}")
+        return True
 
     except Exception as e:
-        print(f"[{datetime.now()}] ⚠ Ошибка при запуске ffmpeg: {e}")
+        print(f"[{datetime.now()}] \u26a0 Ошибка при запуске ffmpeg: {e}")
         return False
 
 
 def continuous_playback():
     current_category = get_current_category()
-    print(f"[{datetime.now()}] ▶ Начинаем показ категории: {current_category}")
+    print(f"[{datetime.now()}] \u25b6 Начинаем показ категории: {current_category}")
 
-    while True:
+    while not shutdown_event.is_set():
         new_category = get_current_category()
-
         if new_category != current_category:
-            print(f"[{datetime.now()}] 🔄 Переход на новую категорию: {new_category}")
+            print(f"[{datetime.now()}] \U0001f504 Переход на новую категорию: {new_category}")
             current_category = new_category
 
         folder = os.path.join(BASE_PATH, VIDEO_DIRS[current_category])
         all_videos = find_videos(folder)
-        already_played = played_videos[current_category]
 
         if not all_videos:
-            print(f"[{datetime.now()}] ⚠ Нет видео в папке: {folder}")
-            time.sleep(10)
+            print(f"[{datetime.now()}] \u26a0 Нет видео в папке: {folder}")
+            shutdown_event.wait(timeout=10)
             continue
 
-        # Обновляем список невоспроизведённых
-        unplayed_videos = [v for v in all_videos if v not in already_played]
-        if not unplayed_videos:
-            print(f"[{datetime.now()}] ✅ Все видео в {current_category} были воспроизведены. Сброс.")
+        unplayed = [v for v in all_videos if v not in played_videos[current_category]]
+        if not unplayed:
+            print(f"[{datetime.now()}] \u2705 Все видео в {current_category} были воспроизведены. Сброс.")
             played_videos[current_category].clear()
-            unplayed_videos = all_videos[:]
+            unplayed = all_videos[:]
 
-        random.shuffle(unplayed_videos)  # случайный порядок
+        video_path = random.choice(unplayed)
 
-        for video_path in unplayed_videos:
-            print(f"[{datetime.now()}] 🟡 Пытаемся воспроизвести: {video_path}")
-            success = play_video(video_path)
+        print(f"[{datetime.now()}] \U0001f7e1 Пытаемся воспроизвести: {video_path}")
+        success = play_video(video_path)
 
-            if success:
-                played_videos[current_category].add(video_path)
-                break  # выйти из цикла и перейти к следующему видео
-            else:
-                print(f"[{datetime.now()}] ⚠ Ошибка с {video_path} — пробуем следующее...\n")
-                continue  # пробуем следующее видео
+        # Mark as played regardless — on error, skip to next video next iteration
+        played_videos[current_category].add(video_path)
 
-        time.sleep(1)
+        if not success:
+            print(f"[{datetime.now()}] \u26a0 Ошибка с {video_path} — пробуем следующее...\n")
+
+        shutdown_event.wait(timeout=1)
+
 
 if __name__ == '__main__':
-    print("🚀 IPTV-поток запущен. Ожидаем видео...\n")
+    print("\U0001f680 IPTV-поток запущен. Ожидаем видео...\n")
     continuous_playback()
