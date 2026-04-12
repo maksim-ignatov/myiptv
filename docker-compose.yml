@@ -24,10 +24,14 @@ services:
     container_name: myiptv
     environment:
       - TZ=Europe/Moscow
+      # VIDEOS_BASE=/app/videos  # путь к папке с видео (по умолчанию /app/videos)
+      # AUDIO_TRACK=0            # дефолтная аудиодорожка если не задана в конфиге
+      # RTSP_URL=rtsp://mediamtx:8554/stream
     volumes:
-      - ./videos:/app/videos
-      - /mnt/nas/torrents/cartoons/South Park:/app/videos/late_evening
-      - ./audio_config.myiptv:/app/audio_config.myiptv
+      - /mnt/nas/torrents/cartoons:/app/videos   # все шоу доступны как /app/videos/<название папки>
+      - ./config.myiptv:/app/config.myiptv
+      # ./assets:/app/assets  # раскомментировать чтобы переопределить логотип без пересборки образа
+      - ./data:/app/data                         # история просмотров (played.json)
     depends_on:
       mediamtx:
         condition: service_healthy

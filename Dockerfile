@@ -8,7 +8,8 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY . .
 
-RUN mkdir -p videos && \
-    chmod +x stream.py
+RUN mkdir -p videos data assets && \
+    chmod +x stream.py && \
+    find assets -type f -exec chmod 644 {} \;
 
 CMD ["python3", "-u", "stream.py"]

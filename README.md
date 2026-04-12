@@ -1,32 +1,61 @@
-# 📺 My IPTV
+# 📺 myiptv
 
-Ваш собственный IPTV-сервер (Linux) - RTSP
+Личный IPTV-сервер. Берёт видео с диска/NAS, стримит как непрерывный телеканал по RTSP.
 
-## 🚀 Установка
-
-```bash
-git clone https://github.com/maksim-ignatov/myiptv.git
-```
+## Быстрый старт
 
 ```bash
+git clone https://github.com/maksimignatov1337/myiptv.git
 cd myiptv
 ```
 
-## 📂 Подготовка видео
+Укажите путь к видео в `docker-compose.yml`:
+```yaml
+- /path/to/your/videos:/app/videos
+```
 
-Положите видеофайлы в директории внутри папки `videos/`.
-
-
-## 🐳 Запуск через Docker Compose
-
+Настройте `config.myiptv`, затем:
 ```bash
 docker compose up -d
 ```
 
-## ✅ Результат
+Смотреть: `rtsp://<сервер>:8554/stream`
 
-Теперь вы получите ссылку для просмотра IPTV:
+## config.myiptv
 
-```bash
-rtsp://<server_address>:8554/stream
+Всё управление через один файл. Примеры и описание форматов — внутри файла.
+
+**Расписание** — шоу по времени суток:
+```ini
+[late_evening]
+South Park = rus:2
+
+[morning]
+Чудеса на виражах = rus
+
+[*]
+Goofy Goof Troop =    # играет в любое время
+```
+
+**Подпапки** — разные настройки для сезонов:
+```ini
+South Park = rus:2
+South Park/Season 7 = eng
+```
+
+**Логотип:**
+```ini
+[settings]
+logo = assets/logo.png
+logo_position = bottom-left   # top-left, top-right, bottom-left, bottom-right
+```
+
+## Структура
+
+```
+myiptv/
+  config.myiptv       # расписание, аудио, логотип
+  docker-compose.yml
+  assets/             # логотипы (PNG с прозрачностью)
+  data/               # история просмотров — создаётся автоматически
 ```
