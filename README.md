@@ -48,6 +48,8 @@ South Park/Season 7 = eng
 [settings]
 logo = assets/logo.png
 logo_position = bottom-left   # top-left, top-right, bottom-left, bottom-right
+logo_offset_x = 10            # отступ от края по горизонтали в пикселях (по умолчанию 10)
+logo_offset_y = 10            # отступ от края по вертикали в пикселях (по умолчанию 10)
 ```
 
 **Без повторов подряд** — если в слоте несколько шоу, следующее всегда будет другим:

@@ -29,9 +29,12 @@
 [settings]
 logo = assets/logo-example.png
 logo_position = bottom-left
+logo_offset_x = 10
+logo_offset_y = 10
 no_repeat = true
 # no_repeat: true — следующее шоу всегда другое (если шоу > 1 в слоте), false — случайно
 # logo_position: top-left, top-right, bottom-left, bottom-right
+# logo_offset_x / logo_offset_y: отступ логотипа от края в пикселях (по умолчанию 10)
 # Закомментируйте logo чтобы отключить логотип
 
 # [late_evening]

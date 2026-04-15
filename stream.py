@@ -23,10 +23,10 @@ SLOTS = ('early_morning', 'morning', 'late_morning', 'afternoon',
          'evening', 'late_evening', 'night', 'late_night')
 
 LOGO_POSITIONS = {
-    'top-left':     '10:10',
-    'top-right':    'W-w-10:10',
-    'bottom-left':  '10:H-h-10',
-    'bottom-right': 'W-w-10:H-h-10',
+    'top-left':     '{x}:{y}',
+    'top-right':    'W-w-{x}:{y}',
+    'bottom-left':  '{x}:H-h-{y}',
+    'bottom-right': 'W-w-{x}:H-h-{y}',
 }
 
 shutdown_event = threading.Event()
@@ -297,8 +297,10 @@ def print_schedule_summary(config):
     raw = settings.get('logo', '').strip()
     logo_path = raw if os.path.isabs(raw) else (os.path.join(BASE_PATH, raw) if raw else '')
     position = settings.get('logo_position', 'bottom-left')
+    ox = settings.get('logo_offset_x', '10')
+    oy = settings.get('logo_offset_y', '10')
     if _logo_exists(logo_path):
-        print(_c(_BLUE, f"   🖼 Логотип: {logo_path} ({position})"))
+        print(_c(_BLUE, f"   🖼 Логотип: {logo_path} ({position}, отступ: {ox}x{oy}px)"))
     elif logo_path:
         print(_c(_RED, f"   🖼 Логотип: ⚠ файл не найден ({logo_path})"))
     else:
@@ -395,7 +397,9 @@ def build_inner_cmd(video_path, audio_track, settings):
     raw = settings.get('logo', '').strip()
     logo_path = raw if os.path.isabs(raw) else (os.path.join(BASE_PATH, raw) if raw else '')
     position_key = settings.get('logo_position', 'bottom-left')
-    overlay_pos = LOGO_POSITIONS.get(position_key, LOGO_POSITIONS['bottom-left'])
+    ox = settings.get('logo_offset_x', '10').strip()
+    oy = settings.get('logo_offset_y', '10').strip()
+    overlay_pos = LOGO_POSITIONS.get(position_key, LOGO_POSITIONS['bottom-left']).format(x=ox, y=oy)
 
     if _logo_exists(logo_path):
         return [
