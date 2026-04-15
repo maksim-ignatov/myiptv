@@ -23,11 +23,14 @@
 #
 # Если несколько шоу в одном слоте — чередуются 50/50 независимо от количества серий.
 # Каждое шоу помнит что уже показывалось (saved в data/played.json).
+# no_repeat = true: одно шоу не запустится дважды подряд (если шоу в слоте > 1).
 # =====================================================
 
 [settings]
 logo = assets/logo-example.png
 logo_position = bottom-left
+no_repeat = true
+# no_repeat: true — следующее шоу всегда другое (если шоу > 1 в слоте), false — случайно
 # logo_position: top-left, top-right, bottom-left, bottom-right
 # Закомментируйте logo чтобы отключить логотип
 

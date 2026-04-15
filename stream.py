@@ -32,6 +32,7 @@ LOGO_POSITIONS = {
 shutdown_event = threading.Event()
 played_videos = {}
 outer_process = None
+last_video = {}   # slot → последнее выбранное шоу (для no_repeat)
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +579,17 @@ def continuous_playback():
             _run_blackscreen(30)
             continue
 
-        chosen_show = random.choice(list(available.keys()))
+        no_repeat = settings.get('no_repeat', 'false').strip().lower() == 'true'
+        show_keys = list(available.keys())
+        if no_repeat and len(show_keys) > 1:
+            prev = last_video.get(current_slot)
+            candidates = [s for s in show_keys if s != prev]
+            chosen_show = random.choice(candidates if candidates else show_keys)
+            if prev:
+                print(f"{_ts()} {_c(_BLUE, f'🔀 no_repeat: пропускаем {repr(prev)} → выбираем из {[s for s in show_keys if s != prev]}')}")
+        else:
+            chosen_show = random.choice(show_keys)
+        last_video[current_slot] = chosen_show
         video_path = random.choice(available[chosen_show])
 
         total = len(show_videos[chosen_show])
@@ -665,6 +676,12 @@ if __name__ == '__main__':
 
     print(f"{_c(_GREEN, '🚀 IPTV-поток запущен.')}\n")
     print(f"{_c(_BLUE, f'📝 Лог: {log_file}')}")
+    _cfg = load_config()
+    _no_repeat = _cfg.get('settings', {}).get('no_repeat', 'false').strip().lower() == 'true'
+    if _no_repeat:
+        print(f"{_c(_CYAN, '🔀 no_repeat = true: одно шоу подряд не повторяется (если шоу в слоте > 1)')}")
+    else:
+        print(f"{_c(_GRAY, '🔀 no_repeat = false: шоу выбираются случайно без ограничений')}")
     load_played()
-    print_schedule_summary(load_config())
+    print_schedule_summary(_cfg)
     continuous_playback()

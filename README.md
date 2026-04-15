@@ -50,6 +50,14 @@ logo = assets/logo.png
 logo_position = bottom-left   # top-left, top-right, bottom-left, bottom-right
 ```
 
+**Без повторов подряд** — если в слоте несколько шоу, следующее всегда будет другим:
+```ini
+[settings]
+no_repeat = true   # по умолчанию true
+```
+
+При `no_repeat = true`: после `Шоу А` никогда не запустится снова `Шоу А` — только `Шоу Б`, `Шоу В` и т.д. Если в слоте одно шоу — настройка не влияет.
+
 ## Структура
 
 ```
